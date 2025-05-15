@@ -1,0 +1,192 @@
+From 178384cc2b971431880f05e37d21b1b39c0b9416 Mon Sep 17 00:00:00 2001
+From: Muhammad Adil Ghaffar <muhammad.adil.ghaffar@est.tech>
+Date: Thu, 27 Feb 2025 19:48:51 +0200
+Subject: [PATCH] Kubecinfig revokation for 1.32 based on
+ https://github.com/kubernetes/kubernetes/pull/122203/files
+
+Signed-off-by: Muhammad Adil Ghaffar <muhammad.adil.ghaffar@est.tech>
+---
+ pkg/kubeapiserver/options/serving.go          |  1 +
+ .../src/k8s.io/apiserver/pkg/server/config.go |  3 +
+ .../apiserver/pkg/server/options/serving.go   | 13 ++++
+ .../apiserver/pkg/server/secure_serving.go    | 62 +++++++++++++++++++
+ staging/src/k8s.io/client-go/util/cert/io.go  | 10 +++
+ 5 files changed, 89 insertions(+)
+
+diff --git a/pkg/kubeapiserver/options/serving.go b/pkg/kubeapiserver/options/serving.go
+index 29d9415d416..43e82057a42 100644
+--- a/pkg/kubeapiserver/options/serving.go
++++ b/pkg/kubeapiserver/options/serving.go
+@@ -33,6 +33,7 @@ func NewSecureServingOptions() *genericoptions.SecureServingOptionsWithLoopback
+ 			PairName:      "apiserver",
+ 			CertDirectory: "/var/run/kubernetes",
+ 		},
++		CertificateRevocationList: "",
+ 	}
+ 	return o.WithLoopback()
+ }
+diff --git a/staging/src/k8s.io/apiserver/pkg/server/config.go b/staging/src/k8s.io/apiserver/pkg/server/config.go
+index 3e8a6b8c068..ef1d2784d2f 100644
+--- a/staging/src/k8s.io/apiserver/pkg/server/config.go
++++ b/staging/src/k8s.io/apiserver/pkg/server/config.go
+@@ -370,6 +370,9 @@ type SecureServingInfo struct {
+ 
+ 	// DisableHTTP2 indicates that http2 should not be enabled.
+ 	DisableHTTP2 bool
++
++	// Certificate revocation list filename
++	CertificateRevocationList string
+ }
+ 
+ type AuthenticationInfo struct {
+diff --git a/staging/src/k8s.io/apiserver/pkg/server/options/serving.go b/staging/src/k8s.io/apiserver/pkg/server/options/serving.go
+index 21a2736e107..d9eac0a3cc8 100644
+--- a/staging/src/k8s.io/apiserver/pkg/server/options/serving.go
++++ b/staging/src/k8s.io/apiserver/pkg/server/options/serving.go
+@@ -78,6 +78,9 @@ type SecureServingOptions struct {
+ 
+ 	// PermitAddressSharing controls if SO_REUSEADDR is used when binding the port.
+ 	PermitAddressSharing bool
++
++	// Certificate revocation list filename
++	CertificateRevocationList string
+ }
+ 
+ type CertKey struct {
+@@ -218,6 +221,9 @@ func (s *SecureServingOptions) AddFlags(fs *pflag.FlagSet) {
+ 		"If true, SO_REUSEADDR will be used when binding the port. This allows binding "+
+ 			"to wildcard IPs like 0.0.0.0 and specific IPs in parallel, and it avoids waiting "+
+ 			"for the kernel to release sockets in TIME_WAIT state. [default=false]")
++	fs.StringVar(&s.CertificateRevocationList, "certificate-revocation-list", "", ""+
++		"Path to local certificate revocation list. If provided, clients providing a certificate listed in the "+
++		"file will be rejected")
+ }
+ 
+ // ApplyTo fills up serving information in the server configuration.
+@@ -262,6 +268,7 @@ func (s *SecureServingOptions) ApplyTo(config **server.SecureServingInfo) error
+ 		Listener:                     s.Listener,
+ 		HTTP2MaxStreamsPerConnection: s.HTTP2MaxStreamsPerConnection,
+ 		DisableHTTP2:                 s.DisableHTTP2Serving,
++		CertificateRevocationList:    s.CertificateRevocationList,
+ 	}
+ 	c := *config
+ 
+@@ -334,6 +341,12 @@ func (s *SecureServingOptions) ApplyTo(config **server.SecureServingInfo) error
+ 	}
+ 	c.SNICerts = namedTLSCerts
+ 
++	// check crl file exists if crl is set
++	if len(s.CertificateRevocationList) > 0 {
++		if _, err := certutil.CertificateRevocationListFromFile(s.CertificateRevocationList); err != nil {
++			return err
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go b/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go
+index 867c7efac2c..7e72eb956e7 100644
+--- a/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go
++++ b/staging/src/k8s.io/apiserver/pkg/server/secure_serving.go
+@@ -17,8 +17,11 @@ limitations under the License.
+ package server
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/tls"
++	"crypto/x509"
++	"encoding/pem"
+ 	"fmt"
+ 	"io"
+ 	"log"
+@@ -78,6 +81,65 @@ func (s *SecureServingInfo) tlsConfig(stopCh <-chan struct{}) (*tls.Config, erro
+ 		tlsConfig.ClientAuth = tls.RequestClientCert
+ 	}
+ 
++	klog.Info("Checking CertificateRevocationList")
++
++	if s.CertificateRevocationList != "" {
++		klog.Info("Checking CertificateRevocationList")
++		prevVerify := tlsConfig.VerifyConnection
++		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
++			if prevVerify != nil {
++				if err := prevVerify(state); err != nil {
++					return err
++				}
++			}
++
++			certs := state.PeerCertificates
++			if len(certs) == 0 {
++				return nil
++			}
++
++			// Load CRL
++			crlBytes, err := os.ReadFile(s.CertificateRevocationList)
++			if err != nil {
++				return err
++			}
++
++			// Decode PEM if present
++			if bytes.HasPrefix(crlBytes, []byte("-----BEGIN X509 CRL")) {
++				block, _ := pem.Decode(crlBytes)
++				if block != nil && block.Type == "X509 CRL" {
++					crlBytes = block.Bytes
++				}
++			}
++
++			// Check crl file is empty
++			if len(crlBytes) == 0 {
++				klog.Infof("crl file %s is empty", s.CertificateRevocationList)
++				return nil
++			}
++
++			crl, err := x509.ParseRevocationList(crlBytes)
++			if err != nil {
++				return err
++			}
++			revokedSerials := make(map[string]struct{})
++			for _, rc := range crl.RevokedCertificateEntries {
++				revokedSerials[string(rc.SerialNumber.Bytes())] = struct{}{}
++			}
++
++			// Check peer certificates against CRL
++			for _, c := range certs {
++				serial := string(c.SerialNumber.Bytes())
++				if _, ok := revokedSerials[serial]; ok {
++					klog.Infof("certificate serial %x is revoked", serial)
++					return fmt.Errorf("certificate serial %x is revoked", serial)
++				}
++			}
++
++			return nil
++		}
++	}
++
+ 	if s.ClientCA != nil || s.Cert != nil || len(s.SNICerts) > 0 {
+ 		dynamicCertificateController := dynamiccertificates.NewDynamicServingCertificateController(
+ 			tlsConfig,
+diff --git a/staging/src/k8s.io/client-go/util/cert/io.go b/staging/src/k8s.io/client-go/util/cert/io.go
+index a70e5132719..fee220cb503 100644
+--- a/staging/src/k8s.io/client-go/util/cert/io.go
++++ b/staging/src/k8s.io/client-go/util/cert/io.go
+@@ -44,6 +44,16 @@ func CanReadCertAndKey(certPath, keyPath string) (bool, error) {
+ 	return true, nil
+ }
+ 
++// CertificateRevocationListFromFile returns true if the CRL file already exists,
++// otherwise returns false.
++func CertificateRevocationListFromFile(crlFilePath string) (bool, error) {
++	crlReadable := canReadFile(crlFilePath)
++	if crlReadable == false {
++		return false, nil
++	}
++	return true, nil
++}
++
+ // If the file represented by path exists and
+ // readable, returns true otherwise returns false.
+ func canReadFile(path string) bool {
+-- 
+2.39.2 (Apple Git-143)
+
