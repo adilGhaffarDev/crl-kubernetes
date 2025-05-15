@@ -1,7 +1,7 @@
-From 178384cc2b971431880f05e37d21b1b39c0b9416 Mon Sep 17 00:00:00 2001
+From cf6ebb9ca736c9739f869a3e7ffa5bc9bc596838 Mon Sep 17 00:00:00 2001
 From: Muhammad Adil Ghaffar <muhammad.adil.ghaffar@est.tech>
 Date: Thu, 27 Feb 2025 19:48:51 +0200
-Subject: [PATCH] Kubecinfig revokation for 1.32 based on
+Subject: [PATCH] Kubecinfig revokation for 1.33 based on
  https://github.com/kubernetes/kubernetes/pull/122203/files
 
 Signed-off-by: Muhammad Adil Ghaffar <muhammad.adil.ghaffar@est.tech>
